@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "blackhole-preview",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["preview/server.py"],
+      "port": 8765
+    }
+  ]
+}
