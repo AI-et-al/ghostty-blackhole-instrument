@@ -209,5 +209,147 @@ class Step(unittest.TestCase):
         self.assertEqual(f, f2)
 
 
+class TickAndAgyHook(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old_state_dir = bt.STATE_DIR
+        self.old_no_watcher = os.environ.get("BLACKHOLE_NO_WATCHER")
+        bt.STATE_DIR = os.path.join(self.tmp.name, "state")
+        os.environ["BLACKHOLE_NO_WATCHER"] = "1"
+        self.tty = os.path.join(self.tmp.name, "fake-tty")
+        self.tx = os.path.join(self.tmp.name, "transcript.jsonl")
+
+    def tearDown(self):
+        bt.STATE_DIR = self.old_state_dir
+        if self.old_no_watcher is None:
+            os.environ.pop("BLACKHOLE_NO_WATCHER", None)
+        else:
+            os.environ["BLACKHOLE_NO_WATCHER"] = self.old_no_watcher
+        self.tmp.cleanup()
+
+    def write_panel(self, obj, text="step\n"):
+        import json
+        with open(self.tx, "w") as f:
+            f.write(text)
+        self.panel_obj = obj
+
+    def test_neutral_tick_lifecycle_and_tokenograph_fill(self):
+        import unittest.mock as mock
+        # 1. Start -> seed hole (fill 0, idle burn 0)
+        self.assertEqual(bt.main(["tick", "--session", "s1", "--event", "start", "--tty", self.tty]), 0)
+        st = bt.load_state(bt.state_path("s1"))
+        self.assertEqual((st["frame"]["fill"], st["frame"]["burn"]), (0, 0))
+        with open(self.tty, "rb") as f:
+            self.assertEqual(f.read(), bt.frame_bytes(st["frame"]))
+
+        # 2. Mid-turn tick without --fill pulls fill from Tokenograph stats.context.pct
+        tg_data = panel([model_call(1, 3, 200, 99800, 320, stop="tool_use")], window=1_000_000)
+        tg_data["stats"]["context"] = {"used": 320_000, "window": 1_000_000, "pct": 0.32}
+        self.write_panel(tg_data, "line1\n")
+        with mock.patch.object(bt, "run_tokenograph", return_value=tg_data):
+            self.assertEqual(bt.main(["tick", "--session", "s1", "--transcript", self.tx, "--tty", self.tty]), 0)
+        st = bt.load_state(bt.state_path("s1"))
+        self.assertEqual(st["frame"]["fill"], round(0.32 * 250))
+        self.assertGreater(st["frame"]["burn"], 0)
+        self.assertTrue(st["working"])
+
+        # 3. Stop settles disk to idle while preserving fill
+        self.assertEqual(bt.main(["tick", "--session", "s1", "--event", "stop", "--tty", self.tty]), 0)
+        st = bt.load_state(bt.state_path("s1"))
+        self.assertEqual((st["frame"]["fill"], st["frame"]["burn"]), (round(0.32 * 250), 0))
+
+        # 4. End emits reset_bytes and deletes session state
+        self.assertEqual(bt.main(["tick", "--session", "s1", "--event", "end"]), 0)
+        with open(self.tty, "rb") as f:
+            self.assertEqual(f.read(), bt.reset_bytes())
+        self.assertFalse(os.path.exists(bt.state_path("s1")))
+
+    def test_agy_hook_contract_and_lifecycle(self):
+        import io
+        import json
+        import unittest.mock as mock
+
+        def invoke(payload, tty_pair=(None, None)):
+            stdin = io.StringIO(payload if isinstance(payload, str) else json.dumps(payload))
+            stdout = io.StringIO()
+            with mock.patch.object(bt.sys, "stdin", stdin), \
+                    mock.patch.object(bt.sys, "stdout", stdout), \
+                    mock.patch.object(bt, "agy_tty_and_pid", return_value=tty_pair):
+                rc = bt.main(["agy-hook"])
+            return rc, stdout.getvalue()
+
+        sid = "conv-123"
+        # SessionStart -> {} on stdout, seed hole on tty
+        rc, out = invoke({"hookEventName": "SessionStart", "conversationId": sid,
+                          "transcriptPath": self.tx}, (self.tty, 4242))
+        self.assertEqual((rc, json.loads(out)), (0, {}))
+        st = bt.load_state(bt.state_path(sid))
+        self.assertEqual((st["frame"]["fill"], st["frame"]["burn"], st["tty"]), (0, 0, self.tty))
+
+        # PreInvocation -> {} on stdout, disk wakes up
+        tg1 = panel([model_call(1, 3, 500, 24500, 200, stop="tool_use")], window=1_000_000)
+        tg1["stats"]["context"] = {"used": 25_000, "window": 1_000_000, "pct": 0.025}
+        self.write_panel(tg1, "step1\n")
+        with mock.patch.object(bt, "run_tokenograph", return_value=tg1):
+            rc, out = invoke({"hookEventName": "PreInvocation", "conversationId": sid,
+                              "transcriptPath": self.tx}, (self.tty, 4242))
+        self.assertEqual((rc, json.loads(out)), (0, {}))
+        st = bt.load_state(bt.state_path(sid))
+        self.assertGreater(st["frame"]["burn"], 0)
+
+        # PostToolUse after a cache rebuild -> flare fires
+        tg2 = panel([model_call(1, 3, 500, 24500, 200), model_call(4, 7, 400_000, 0, 250)],
+                    events=[{"t": 4.0, "recomputed": 400_000}], window=1_000_000)
+        tg2["stats"]["context"] = {"used": 400_000, "window": 1_000_000, "pct": 0.40}
+        self.write_panel(tg2, "step1\nstep2\n")
+        with mock.patch.object(bt, "run_tokenograph", return_value=tg2):
+            rc, out = invoke({"hookEventName": "PostToolUse", "conversationId": sid,
+                              "transcriptPath": self.tx}, (self.tty, 4242))
+        self.assertEqual((rc, json.loads(out)), (0, {}))
+        st = bt.load_state(bt.state_path(sid))
+        self.assertEqual((st["frame"]["fill"], st["frame"]["kind"]), (100, bt.FLARE_REBUILD))
+
+        # Stop -> {"decision": "allow"} on stdout, burn settles to 0
+        rc, out = invoke({"hookEventName": "Stop", "conversationId": sid,
+                          "transcriptPath": self.tx}, (self.tty, 4242))
+        self.assertEqual((rc, json.loads(out)), (0, {"decision": "allow"}))
+        self.assertEqual(bt.load_state(bt.state_path(sid))["frame"]["burn"], 0)
+
+        # GUI session (no tty) and malformed stdin never raise and always emit valid JSON
+        tty2 = os.path.join(self.tmp.name, "unused-tty")
+        rc, out = invoke({"hookEventName": "Stop", "conversationId": "gui"}, (None, None))
+        self.assertEqual((rc, json.loads(out)), (0, {"decision": "allow"}))
+        self.assertFalse(os.path.exists(tty2))
+        rc, out = invoke("{broken json", (self.tty, 4242))
+        self.assertEqual((rc, json.loads(out)), (0, {}))
+
+    def test_exit_watcher_resets_when_parent_dies_and_respects_newer_session(self):
+        import subprocess
+        import time
+        bt.main(["tick", "--session", "s-exit", "--event", "start", "--tty", self.tty])
+        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(0.1)"])
+        try:
+            self.assertEqual(bt.main(["watch-exit", "--session", "s-exit",
+                                      "--pid", str(proc.pid), "--tty", self.tty]), 0)
+        finally:
+            proc.wait()
+        with open(self.tty, "rb") as f:
+            self.assertEqual(f.read(), bt.reset_bytes())
+        self.assertFalse(os.path.exists(bt.state_path("s-exit")))
+
+        # If a newer session took over the same tty before the old one ends, do not clobber it
+        bt.main(["tick", "--session", "s-old", "--event", "start", "--tty", self.tty])
+        time.sleep(0.02)
+        bt.main(["tick", "--session", "s-new", "--fill", "0.5", "--tty", self.tty])
+        with open(self.tty, "rb") as f:
+            newer_frame = f.read()
+        bt.tick_session("s-old", event="end", tty=self.tty, use_dev_tty=False)
+        with open(self.tty, "rb") as f:
+            self.assertEqual(f.read(), newer_frame)
+        self.assertFalse(os.path.exists(bt.state_path("s-old")))
+        self.assertTrue(os.path.exists(bt.state_path("s-new")))
+
+
 if __name__ == "__main__":
     unittest.main()

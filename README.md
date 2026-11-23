@@ -33,7 +33,8 @@ section on how it works should be enough for you or your agent to adapt it.
 ## Requirements
 
 - **Ghostty 1.4.0 or later.** The instrument needs the `iPalette` shader input.
-- **Claude Code**, running in Ghostty directly (tmux and zellij need OSC passthrough).
+- **Claude Code** or **Antigravity (`agy`)**, running in Ghostty directly (tmux and zellij
+  need OSC passthrough).
 - **Python 3.8+.** The bridge uses only the standard library.
 - **Tokenograph**, for burn, heat and flares. Without it the hole still tracks context fill.
 - **macOS with the Swift toolchain**, only for the hover legend.
@@ -54,7 +55,8 @@ format and the shader decode together.
 git clone https://github.com/AI-et-al/ghostty-blackhole-instrument
 cd ghostty-blackhole-instrument
 pipx install git+https://github.com/AI-et-al/Tokenograph     # or: uv tool install ...
-scripts/switch.py on             # then reload Ghostty's config: Cmd+Shift+, on macOS
+scripts/switch.py on                   # Claude Code (default) + Ghostty; reload: Cmd+Shift+,
+scripts/switch.py on --harness agy     # Antigravity (agy) + Ghostty (can coexist with Claude)
 ```
 
 Keep the checkout where you cloned it: the installer points Ghostty and Claude Code at the
@@ -70,6 +72,10 @@ files in place. If you move the folder, run `scripts/switch.py off` first and `o
 - **Status line:** if you have none, the bridge becomes it. If yours calls upstream
   `claude-token.py`, that call is swapped for the bridge. Any other status line is kept and
   wrapped: a small script feeds the bridge, then runs yours unchanged.
+- **Antigravity (`--harness agy`):** adds a `"blackhole-instrument"` hook group to
+  `~/.gemini/config/hooks.json` (`SessionStart`, `PreInvocation`, `PostToolUse`,
+  `PostInvocation` and `Stop`) alongside any existing hooks, plus a detached exit sentinel
+  so quitting `agy` resets the hole and palette.
 - **Tuner:** if you use the upstream tuner (`~/ghostty-blackhole`), its shader symlink is
   pointed at the instrument, so its sliders, including the new ones, edit the live shader.
 
@@ -77,8 +83,9 @@ Every file is backed up before its first change, and what was done is recorded i
 `~/.config/blackhole-instrument/install.json`. To undo it:
 
 ```sh
-scripts/switch.py off            # then reload Ghostty's config again
-scripts/switch.py status         # what is wired where
+scripts/switch.py off                  # undo all installed harnesses; reload Ghostty
+scripts/switch.py off --harness agy    # undo Antigravity only, leaving Claude Code wired
+scripts/switch.py status               # what is wired where
 ```
 
 Reload Ghostty straight after switching either way. The instrument shader understands the

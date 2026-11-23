@@ -107,34 +107,35 @@ Not known, and yours to find out:
   but it reported `working: true` for a session with no calls. Decide if that is right at
   session start.
 
-## Antigravity (`agy`)
+## Antigravity (`agy`) — landed 2026-11-22
 
-Checked on the same Mac with `agy 1.5.9`:
+Verified and implemented on macOS 27 inside a live `agy` Ghostty session:
 
-- **Tokenograph has no Antigravity adapter.** Its formats are `claude`, `codex` and `pi`.
-- **Conversations are SQLite files**, one `.db` per conversation, under
-  `~/.gemini/antigravity/conversations/` and `~/.gemini/antigravity-cli/conversations/`.
-  Their schema was not inspected.
-- **Hooks appear to exist.** `~/.gemini/settings.json` has a `hooks` block with
-  `SessionStart`, `BeforeAgent`, `AfterAgent`, `BeforeTool`, `AfterTool`, `Notification`
-  and `PreCompress`, and `~/.gemini/antigravity-cli/settings.json` has an `enableJsonHooks`
-  key. Whether `agy` honours the first file, and what it passes to a hook, is unverified.
-
-So this port has a prerequisite the Codex one does not: a source of per-call numbers. Two
-routes, in order of preference:
-
-1. **Write a Tokenograph adapter for Antigravity conversations.** Tokenograph's README has
-   a "Supported harnesses" section describing what an adapter must produce. This is the
-   route that also gives Antigravity users the full Tokenograph panel, and the legend's
-   click target would work unchanged. It belongs in the Tokenograph repository
-   (https://github.com/AI-et-al/Tokenograph), not here.
-2. **Compute the few numbers the instrument needs directly** (fill, output tokens per
-   second, cached versus computed prompt tokens per call, compaction count) and feed them to
-   `step()` as a `metrics` dict. Smaller, but the legend's Tokenograph click would have
-   nothing to open.
-
-Also to find out: whether the conversation database records token usage per call at all.
-If it does not, burn and heat cannot be shown and the port is fill-only.
+- **Transcripts are plain JSONL, not SQLite.** Every session writes
+  `~/.gemini/antigravity*/brain/<id>/.system_generated/logs/transcript.jsonl` alongside an
+  untruncated `transcript_full.jsonl`. `PLANNER_RESPONSE` steps record `created_at`, `model`,
+  uncached `input_tokens`, `cache_read_tokens`, `output_tokens`, `thinking` and `tool_calls`;
+  `CHECKPOINT` steps record compactions.
+- **Tokenograph adapter landed upstream** (`_scan_agy` in `AI-et-al/Tokenograph`), preferring
+  `transcript_full.jsonl` for untruncated tool lengths, pairing tool steps FIFO via their
+  `Created At` / `Completed At` headers, merging sibling `invoke_subagent` transcripts, and
+  leaving legacy unmetered steps out of token/ledger totals. The hover legend's click-to-open
+  Tokenograph panel works unchanged.
+- **Hooks live in `~/.gemini/config/hooks.json`.** `switch.py on --harness agy` installs a
+  top-level `"blackhole-instrument"` entry (`SessionStart`, `PreInvocation`, `PostToolUse`,
+  `PostInvocation`, `Stop`) pointing at `blackhole_instrument.py agy-hook`, which obeys
+  `agy`'s camelCase `stdin` / JSON `stdout` contract over the shared `tick_session()` engine
+  (also exposed as `blackhole_instrument.py tick` for Codex CLI and other harnesses).
+- **Session-end cleanup without `SessionEnd`.** `agy` has no exit hook, so `agy-hook` spawns
+  one zero-CPU detached sentinel (`watch-exit`, using `kqueue` `EVFILT_PROC` `NOTE_EXIT` on
+  macOS with a poll fallback) bound to the ancestor `agy` PID; when `agy` exits it calls
+  `tick_session(..., event="end")` unless a newer session has already claimed the same `tty`.
+- **Verified:** all 62 Tokenograph tests (+ 25 real `agy` transcripts checked against additive
+  wall-clock and ledger-bound invariants), all 45 bridge and installer tests (fake home
+  folders, byte-for-byte restore on `hooks.json` with and without trailing newlines, Claude +
+  `agy` coexistence), live `agy_tty_and_pid()` resolution in Ghostty, and `--dry-run` ticks
+  against the active `agy` session. Live hook attachment on the owner's `~/.gemini/config/hooks.json`
+  was left uninstalled per the ground rules (`switch.py on --harness agy --dry-run` verified).
 
 ## Ground rules
 

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Switch the black hole instrument on or off.
 
-  scripts/switch.py status          show what is wired where
-  scripts/switch.py on [--dry-run]  point Ghostty and Claude Code at the instrument
-  scripts/switch.py off [--dry-run] undo exactly what "on" did
-  scripts/switch.py restart-legend  run the newest build of the hover legend
+  scripts/switch.py status                           show what is wired where
+  scripts/switch.py on [--harness H] [--dry-run]     wire Ghostty and a harness (claude|agy|all)
+  scripts/switch.py off [--harness H] [--dry-run]    undo what "on" did (one harness or all)
+  scripts/switch.py restart-legend                   run the newest build of the hover legend
 
-"on" works out what you already have and changes as little as it can:
+"on" works out what you already have and changes as little as it can (default harness: claude):
 
   Ghostty config     If a custom-shader line points at upstream blackhole.glsl it
                      is replaced; otherwise the instrument shader is added as one
@@ -20,6 +20,10 @@
                      status line runs): it is swapped for the bridge.
                      Anything else: a small wrapper feeds the bridge and then runs
                      your own status line unchanged.
+  Antigravity hooks  (--harness agy) Adds a "blackhole-instrument" entry to
+                     ~/.gemini/config/hooks.json for SessionStart, PreInvocation,
+                     PostToolUse, PostInvocation and Stop, leaving other hooks
+                     and Claude Code's settings untouched.
   Tuner              If ~/ghostty-blackhole/blackhole.glsl is a symlink (the
                      upstream tuner's shader), it is pointed at the instrument.
   Hover legend       If legend/build.sh has been run (macOS), the helper is
@@ -34,6 +38,7 @@ instrument shader understands the upstream bridge, but the upstream shader does
 not understand this bridge and blinks the hole off until Ghostty reloads.
 """
 
+import argparse
 import json
 import os
 import re
@@ -44,6 +49,9 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HOOK_EVENTS = ("SessionStart", "SessionEnd", "UserPromptSubmit", "Stop", "Notification")
+AGY_HOOK_NAME = "blackhole-instrument"
+AGY_HOOK_EVENTS = ("SessionStart", "PreInvocation", "PostToolUse", "PostInvocation", "Stop")
+HARNESSES = ("claude", "agy", "all")
 UPSTREAM_BRIDGE = "claude-token.py"
 UPSTREAM_SHADER = "blackhole.glsl"
 LEGEND_LABEL = "com.blackholeinstrument.legend"
@@ -60,6 +68,7 @@ class Paths:
         self.bridge = os.path.join(root, "blackhole_instrument.py")
         self.settings = os.path.join(self.home, ".claude", "settings.json")
         self.wrapper = os.path.join(self.home, ".claude", "blackhole-statusline.sh")
+        self.agy_hooks = os.path.join(self.home, ".gemini", "config", "hooks.json")
         self.manifest = os.path.join(self.home, ".config", "blackhole-instrument", "install.json")
         self.tuner_link = os.path.join(self.home, "ghostty-blackhole", "blackhole.glsl")
         self.legend_bin = os.path.join(root, "legend", "BlackholeLegend.app", "Contents", "MacOS", "BlackholeLegend")
@@ -69,6 +78,19 @@ class Paths:
         candidates = [os.path.join(self.home, ".config", "ghostty", "config"),
                       os.path.join(self.home, "Library", "Application Support", "com.mitchellh.ghostty", "config")]
         return next((c for c in candidates if os.path.isfile(c)), candidates[0])
+
+    def agy_command(self):
+        return '"%s" agy-hook' % self.bridge
+
+    def agy_hook_spec(self):
+        handler = {"type": "command", "command": self.agy_command(), "timeout": 5}
+        return {
+            "SessionStart": [dict(handler)],
+            "PreInvocation": [dict(handler)],
+            "PostToolUse": [{"matcher": "*", "hooks": [dict(handler)]}],
+            "PostInvocation": [dict(handler)],
+            "Stop": [dict(handler)],
+        }
 
     def legend_plist_text(self):
         return """<?xml version="1.0" encoding="UTF-8"?>
@@ -318,6 +340,51 @@ def settings_off(p, run, record):
         run.write(p.settings, dump_settings(settings, original), "Claude Code hooks and status line")
 
 
+# ------------------------------------------------------ Antigravity hooks --
+def dump_agy_hooks(hooks, original, trailing_newline):
+    indent = 2
+    for line in original.splitlines()[1:2]:
+        indent = len(line) - len(line.lstrip(" ")) or 2
+    return json.dumps(hooks, indent=indent, ensure_ascii=False) + ("\n" if trailing_newline else "")
+
+
+def agy_on(p, run, record):
+    existed = os.path.isfile(p.agy_hooks)
+    original = read(p.agy_hooks) if existed else "{}\n"
+    hooks = json.loads(original)
+    spec = p.agy_hook_spec()
+    if hooks.get(AGY_HOOK_NAME) == spec:
+        run.note("Antigravity hooks (already done)")
+        return record or {"created": not existed, "trailing_newline": original.endswith("\n"),
+                          "previous_entry": None}
+    record = record or {"created": not existed, "trailing_newline": original.endswith("\n"),
+                        "previous_entry": hooks.get(AGY_HOOK_NAME)}
+    hooks[AGY_HOOK_NAME] = spec
+    run.write(p.agy_hooks, dump_agy_hooks(hooks, original, record["trailing_newline"]), "Antigravity hooks")
+    return record
+
+
+def agy_off(p, run, record):
+    if not record or not os.path.isfile(p.agy_hooks):
+        return
+    original = read(p.agy_hooks)
+    hooks = json.loads(original)
+    if AGY_HOOK_NAME not in hooks:
+        run.note("Antigravity hooks (our entry is gone; left alone)")
+        return
+    if record.get("previous_entry") is not None:
+        hooks[AGY_HOOK_NAME] = record["previous_entry"]
+    else:
+        del hooks[AGY_HOOK_NAME]
+    if record.get("created") and not hooks:
+        run.changed.append("Antigravity hooks")
+        if not run.dry:
+            os.remove(p.agy_hooks)
+        return
+    trail = record.get("trailing_newline", original.endswith("\n"))
+    run.write(p.agy_hooks, dump_agy_hooks(hooks, original, trail), "Antigravity hooks")
+
+
 # ------------------------------------------------------- tuner and legend --
 def tuner_on(p, run, record):
     if not os.path.islink(p.tuner_link):
@@ -388,10 +455,14 @@ def load_manifest(p):
         return {}
 
 
-def switch_on(p, run):
+def switch_on(p, run, harness="claude"):
+    targets = ("claude", "agy") if harness == "all" else (harness,)
     m = load_manifest(p)
     m["ghostty"] = ghostty_on(p, run, m.get("ghostty"))
-    m["settings"] = settings_on(p, run, m.get("settings"))
+    if "claude" in targets:
+        m["settings"] = settings_on(p, run, m.get("settings"))
+    if "agy" in targets:
+        m["agy"] = agy_on(p, run, m.get("agy"))
     m["tuner"] = tuner_on(p, run, m.get("tuner"))
     m["legend"] = legend_on(p, run, m.get("legend"))
     if not run.dry:
@@ -401,16 +472,55 @@ def switch_on(p, run):
     return m
 
 
-def switch_off(p, run):
+def switch_off(p, run, harness=None):
     m = load_manifest(p)
     if not m:
         run.note("nothing recorded as installed (no %s)" % p.manifest)
-    ghostty_off(p, run, m.get("ghostty"))
-    settings_off(p, run, m.get("settings"))
-    tuner_off(p, run, m.get("tuner"))
-    legend_off(p, run, m.get("legend"))
-    if not run.dry and os.path.isfile(p.manifest):
-        os.remove(p.manifest)
+        return
+    targets = ("claude", "agy") if harness in (None, "all") else (harness,)
+    if "claude" in targets:
+        if "settings" in m:
+            settings_off(p, run, m.get("settings"))
+            m.pop("settings", None)
+        elif harness == "claude":
+            run.note("Claude Code hooks and status line (not recorded as installed)")
+    if "agy" in targets:
+        if "agy" in m:
+            agy_off(p, run, m.get("agy"))
+            m.pop("agy", None)
+        elif harness == "agy":
+            run.note("Antigravity hooks (not recorded as installed)")
+    if not (m.get("settings") or m.get("agy")):
+        ghostty_off(p, run, m.get("ghostty"))
+        tuner_off(p, run, m.get("tuner"))
+        legend_off(p, run, m.get("legend"))
+        if not run.dry and os.path.isfile(p.manifest):
+            os.remove(p.manifest)
+    elif not run.dry:
+        os.makedirs(os.path.dirname(p.manifest), exist_ok=True)
+        with open(p.manifest, "w") as f:
+            json.dump(m, f, indent=2)
+
+
+def agy_wired_count(p):
+    try:
+        agy = json.loads(read(p.agy_hooks))
+    except (OSError, ValueError):
+        return 0
+    block = agy.get(AGY_HOOK_NAME) if isinstance(agy, dict) else None
+    if not isinstance(block, dict):
+        return 0
+    count = 0
+    for event in AGY_HOOK_EVENTS:
+        items = block.get(event) or []
+        if event == "PostToolUse":
+            ok = any(p.bridge in (h.get("command") or "")
+                     for g in items if isinstance(g, dict)
+                     for h in (g.get("hooks") or []) if isinstance(h, dict))
+        else:
+            ok = any(p.bridge in (h.get("command") or "") for h in items if isinstance(h, dict))
+        count += int(ok)
+    return count
 
 
 def status(p):
@@ -429,6 +539,7 @@ def status(p):
     script = script_of(command, p.home) if command else None
     feeds = p.bridge in command or command == p.wrapper or bool(script and p.bridge in read(script))
     print("status line         ", "feeds the bridge" if feeds else "not wired")
+    print("Antigravity hooks   ", "%d of %d" % (agy_wired_count(p), len(AGY_HOOK_EVENTS)))
     link = os.readlink(p.tuner_link) if os.path.islink(p.tuner_link) else None
     print("tuner edits         ", "instrument" if link == p.shader else "upstream" if link else "no tuner found")
     print("hover legend        ", "running" if legend_running() else
@@ -451,9 +562,16 @@ def main(argv):
         rc = launchctl("kickstart", "-k", "gui/%d/%s" % (os.getuid(), LEGEND_LABEL))
         print("hover legend restarted" if rc == 0 else "could not restart the hover legend")
         return rc
-    run = Run(dry="--dry-run" in argv[1:])
+    ap = argparse.ArgumentParser(prog="scripts/switch.py " + argv[0])
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--harness", choices=HARNESSES, default="claude" if argv[0] == "on" else None)
+    opts = ap.parse_args(argv[1:])
+    run = Run(dry=opts.dry_run)
     print("Switching the instrument %s%s:" % (argv[0], " (dry run, nothing written)" if run.dry else ""))
-    (switch_on if argv[0] == "on" else switch_off)(p, run)
+    if argv[0] == "on":
+        switch_on(p, run, harness=opts.harness)
+    else:
+        switch_off(p, run, harness=opts.harness)
     for what in run.changed:
         print("  %s  %s" % ("would change" if run.dry else "changed", what))
     for what in run.notes:

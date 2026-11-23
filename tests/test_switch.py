@@ -46,14 +46,14 @@ class Home:
         with open(path) as f:
             return f.read()
 
-    def on(self, dry=False):
+    def on(self, dry=False, harness="claude"):
         run = switch.Run(dry=dry, launchd=False)
-        switch.switch_on(self.p, run)
+        switch.switch_on(self.p, run, harness=harness)
         return run
 
-    def off(self):
+    def off(self, harness=None):
         run = switch.Run(launchd=False)
-        switch.switch_off(self.p, run)
+        switch.switch_off(self.p, run, harness=harness)
         return run
 
     def hook_commands(self, event):
@@ -241,6 +241,101 @@ class Extras(unittest.TestCase):
         self.assertIn(switch.LEGEND_LABEL, plist)
         h.off()
         self.assertFalse(os.path.exists(h.p.legend_plist))
+
+
+class Antigravity(unittest.TestCase):
+    def test_agy_on_from_nothing_then_off_leaves_claude_untouched(self):
+        h = Home()
+        h.on(harness="agy")
+        self.assertIn("custom-shader = " + h.p.shader, h.get(h.config).split("\n"))
+        self.assertEqual(switch.agy_wired_count(h.p), len(switch.AGY_HOOK_EVENTS))
+        self.assertFalse(os.path.exists(h.p.settings))   # Claude settings untouched
+        hooks = json.loads(h.get(h.p.agy_hooks))
+        block = hooks[switch.AGY_HOOK_NAME]
+        self.assertEqual(block["PostToolUse"][0]["matcher"], "*")
+        self.assertEqual(block["Stop"][0]["command"], h.p.agy_command())
+
+        # Second run is idempotent
+        self.assertEqual(h.on(harness="agy").changed, [])
+
+        h.off(harness="agy")
+        self.assertFalse(os.path.exists(h.p.agy_hooks))
+        self.assertEqual(h.get(h.config).strip(), "")
+        self.assertFalse(os.path.exists(h.p.manifest))
+        self.assertFalse(os.path.exists(h.p.settings))
+
+    def test_existing_hooks_json_without_trailing_newline_restores_every_byte(self):
+        h = Home()
+        existing = json.dumps({
+            "herdr": {"PreInvocation": [{"command": "herdr.sh", "timeout": 10, "type": "command"}]},
+            "supacode-hooks": {"Stop": [{"command": "supacode.sh", "timeout": 10, "type": "command"}]},
+            "elevenlabs-narrator": {"Stop": [{"command": "narrate.sh", "timeout": 10, "type": "command"}]},
+        }, indent=2)  # deliberately no trailing newline
+        h.put(h.p.agy_hooks, existing)
+        run = h.on(harness="agy")
+        self.assertIn(h.p.agy_hooks, run.backed_up)
+        installed = json.loads(h.get(h.p.agy_hooks))
+        self.assertEqual(list(installed)[:3], ["herdr", "supacode-hooks", "elevenlabs-narrator"])
+        self.assertIn(switch.AGY_HOOK_NAME, installed)
+
+        h.off(harness="agy")
+        self.assertEqual(h.get(h.p.agy_hooks), existing)
+
+    def test_off_leaves_later_edits_to_hooks_json_alone(self):
+        h = Home()
+        h.put(h.p.agy_hooks, json.dumps({"herdr": {"PreInvocation": []}}, indent=2) + "\n")
+        h.on(harness="agy")
+        edited = json.loads(h.get(h.p.agy_hooks))
+        edited["custom-linter"] = {"PostToolUse": [{"matcher": "edit_file", "hooks": [{"command": "lint"}]}]}
+        h.put(h.p.agy_hooks, json.dumps(edited, indent=2) + "\n")
+
+        h.off(harness="agy")
+        after = json.loads(h.get(h.p.agy_hooks))
+        self.assertNotIn(switch.AGY_HOOK_NAME, after)
+        self.assertIn("herdr", after)
+        self.assertIn("custom-linter", after)
+
+    def test_both_claude_and_agy_coexist_and_uninstall_independently(self):
+        h = Home()
+        config = "font-size = 14\n"
+        claude_before = json.dumps({"model": "opus", "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "say ok"}]}]}}, indent=2) + "\n"
+        agy_before = json.dumps({"herdr": {"PreInvocation": [{"type": "command", "command": "herdr"}]}}, indent=2)
+        h.put(h.config, config)
+        h.put(h.p.settings, claude_before)
+        h.put(h.p.agy_hooks, agy_before)
+
+        # Install Claude, then install Antigravity
+        h.on(harness="claude")
+        claude_wired = h.get(h.p.settings)
+        h.on(harness="agy")
+        self.assertEqual(h.get(h.p.settings), claude_wired)   # agy install did not touch Claude
+        self.assertEqual(switch.agy_wired_count(h.p), len(switch.AGY_HOOK_EVENTS))
+
+        # Remove Antigravity only: Claude + Ghostty stay active
+        h.off(harness="agy")
+        self.assertEqual(h.get(h.p.agy_hooks), agy_before)
+        self.assertEqual(h.get(h.p.settings), claude_wired)
+        self.assertIn("custom-shader = " + h.p.shader, h.get(h.config))
+        self.assertTrue(os.path.isfile(h.p.manifest))
+
+        # Remove Claude: Ghostty and manifest clean up too
+        h.off(harness="claude")
+        self.assertEqual(h.get(h.p.settings), claude_before)
+        self.assertEqual(h.get(h.config), config)
+        self.assertFalse(os.path.exists(h.p.manifest))
+
+        # Reverse: install both at once via --harness all, remove Claude first, then agy
+        h.on(harness="all")
+        self.assertEqual(switch.agy_wired_count(h.p), len(switch.AGY_HOOK_EVENTS))
+        self.assertEqual(len(h.hook_commands("SessionStart")), 1)
+        h.off(harness="claude")
+        self.assertEqual(h.get(h.p.settings), claude_before)
+        self.assertEqual(switch.agy_wired_count(h.p), len(switch.AGY_HOOK_EVENTS))
+        self.assertIn("custom-shader = " + h.p.shader, h.get(h.config))
+        h.off(harness="agy")
+        self.assertEqual(h.get(h.p.agy_hooks), agy_before)
+        self.assertEqual(h.get(h.config), config)
+        self.assertFalse(os.path.exists(h.p.manifest))
 
 
 if __name__ == "__main__":

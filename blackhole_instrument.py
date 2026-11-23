@@ -22,6 +22,12 @@ Claude Code pipes on stdin:
   UserPromptSubmit                 disk wakes up
   Stop / Notification              disk settles to an idle ember
 
+Other harnesses (Antigravity `agy`, Codex CLI, or custom scripts):
+
+  blackhole_instrument.py tick --session <key> [--transcript <path>]
+                               [--fill <0..1>] [--event start|prompt|stop|end]
+  blackhole_instrument.py agy-hook    # stdin/stdout JSON contract for ~/.gemini/config/hooks.json
+
 Manual use, from a Ghostty tab running the instrument shader:
 
   blackhole_instrument.py set --fill 0.4 --burn 0.9 --heat 0.2
@@ -52,6 +58,7 @@ import argparse
 import fcntl
 import json
 import os
+import select
 import shutil
 import subprocess
 import sys
@@ -509,13 +516,111 @@ def session_tty():
     return None
 
 
-def emit(seq, dry_run=False, tty=None):
+def agy_tty_and_pid():
+    """Find the ancestor `agy` CLI process and its Ghostty tty.
+
+    Returns (tty_path, agent_pid); (None, None) when running inside a GUI
+    without an attached terminal.
+    """
+    pid = os.getppid()
+    first_tty = None
+    first_pid = pid if pid > 1 else None
+    for _ in range(10):
+        try:
+            line = subprocess.run(["ps", "-o", "pid=,ppid=,tty=,comm=", "-p", str(pid)],
+                                  capture_output=True, text=True, timeout=1).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            break
+        parts = line.split(None, 3)
+        if len(parts) < 4:
+            break
+        cur_pid = int(parts[0]) if parts[0].isdigit() else None
+        ppid = int(parts[1]) if parts[1].isdigit() else 0
+        tty = "/dev/" + parts[2] if parts[2] not in ("??", "?") else None
+        comm = os.path.basename(parts[3].strip())
+        if tty and first_tty is None:
+            first_tty = tty
+        if comm in ("agy", "antigravity-cli") and tty and cur_pid:
+            return tty, cur_pid
+        if ppid <= 1:
+            break
+        pid = ppid
+    if first_tty:
+        return first_tty, first_pid
+    return None, None
+
+
+def pid_alive(pid):
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def wait_for_exit(pid):
+    """Block with zero CPU until `pid` exits (kqueue on macOS, poll fallback)."""
+    if not pid_alive(pid):
+        return
+    if hasattr(select, "kqueue"):
+        kq = None
+        try:
+            kq = select.kqueue()
+            ev = select.kevent(int(pid), filter=select.KQ_FILTER_PROC,
+                               flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+                               fflags=select.KQ_NOTE_EXIT)
+            kq.control([ev], 1, None)
+            return
+        except OSError:
+            pass
+        finally:
+            if kq is not None:
+                try:
+                    kq.close()
+                except OSError:
+                    pass
+    while pid_alive(pid):
+        time.sleep(1.0)
+
+
+def ensure_exit_watcher(key, agent_pid, tty, state):
+    """Spawn at most one detached sentinel per live `agent_pid` so exiting a
+    harness without a SessionEnd hook resets the hole and palette."""
+    if os.environ.get("BLACKHOLE_NO_WATCHER") or not pid_alive(agent_pid) or not tty:
+        return
+    cur = state.get("watcher") if isinstance(state.get("watcher"), dict) else {}
+    if cur.get("agent_pid") == int(agent_pid) and pid_alive(cur.get("pid")):
+        return
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "watch-exit",
+             "--session", str(key), "--pid", str(int(agent_pid)), "--tty", str(tty)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        state["watcher"] = {"agent_pid": int(agent_pid), "pid": proc.pid}
+    except OSError:
+        pass
+
+
+def emit(seq, dry_run=False, tty=None, use_dev_tty=True):
     """Write escape sequences straight to the session's terminal. `tty` is
     the session's device when already known; otherwise it is looked up."""
     if dry_run:
         print(seq.decode("latin-1").replace("\033", "ESC").replace("\007", " BEL\n"), end="")
         return
-    for path in ("/dev/tty", tty, None):
+    candidates = ((tty,) if tty else ()) + (("/dev/tty",) if use_dev_tty else ()) + (None,)
+    for path in candidates:
         try:
             target = path or session_tty()
             if not target:
@@ -528,6 +633,23 @@ def emit(seq, dry_run=False, tty=None):
 
 
 # ------------------------------------------------------------------ roles --
+TICK_EVENTS = ("start", "prompt", "stop", "end")
+CLAUDE_EVENTS = {
+    "SessionStart": "start",
+    "SessionEnd": "end",
+    "UserPromptSubmit": "prompt",
+    "Stop": "stop",
+    "Notification": "stop",
+}
+AGY_EVENTS = {
+    "SessionStart": ("start", False),
+    "PreInvocation": ("prompt", True),
+    "PostToolUse": (None, True),
+    "PostInvocation": (None, True),
+    "Stop": ("stop", True),
+}
+
+
 def context_fill(data):
     cw = data.get("context_window") or {}
     pct = cw.get("used_percentage")
@@ -550,13 +672,41 @@ def readout(state, frame):
     return "\033[2m" + "  ·  ".join(parts) + "\033[0m"
 
 
-def hook_or_statusline(data, dry_run):
-    event = data.get("hook_event_name")
-    key = data.get("session_id") or "session"
+def newer_session_owns_tty(key, tty, my_mtime):
+    """True when another session state on `tty` was updated since `my_mtime`."""
+    if not tty:
+        return False
+    own = safe_key(key) + ".json"
+    try:
+        names = os.listdir(STATE_DIR)
+    except OSError:
+        return False
+    for name in names:
+        if name == own or not name.endswith(".json") or name.startswith(("legend", "panel-")):
+            continue
+        p = os.path.join(STATE_DIR, name)
+        try:
+            if os.path.getmtime(p) >= my_mtime and load_state(p).get("tty") == tty:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def tick_session(key, transcript=None, fill=None, event=None, refresh=False,
+                 dry_run=False, tty=None, use_dev_tty=True, agent_pid=None):
+    """Harness-neutral tick: advance state, emit frame/reset, return readout."""
     path = state_path(key)
 
-    if event == "SessionEnd":
-        emit(reset_bytes(), dry_run)
+    if event == "end":
+        prev_state = load_state(path)
+        target_tty = tty or prev_state.get("tty")
+        try:
+            my_mtime = os.path.getmtime(path)
+        except OSError:
+            my_mtime = 0.0
+        if dry_run or not newer_session_owns_tty(key, target_tty, my_mtime):
+            emit(reset_bytes(), dry_run, target_tty, use_dev_tty=use_dev_tty)
         if not dry_run:
             close_panel(key)
         for p in (path, path + ".lock"):
@@ -572,36 +722,84 @@ def hook_or_statusline(data, dry_run):
             return None                          # another tick is mid-flight
         now = time.time()
         state = load_state(path)
-        fill = working = metrics = None
-        if event == "SessionStart":
-            state, fill, working = {}, 0.0, False
-        elif event == "UserPromptSubmit":
-            working = True
-        elif event in ("Stop", "Notification"):
+        working = metrics = None
+        if event == "start":
+            state = {}
+            if fill is None:
+                fill = 0.0
             working = False
-        elif event is None:                      # statusLine
-            fill = context_fill(data)
-            transcript = data.get("transcript_path")
+        elif event == "prompt":
+            working = True
+        elif event == "stop":
+            working = False
+        elif event is not None:
+            return None                          # an event we don't act on
+
+        src = transcript or state.get("transcript")
+        if refresh and src:
             try:
-                st = os.stat(transcript)
+                st = os.stat(src)
                 stamp = [st.st_size, st.st_mtime]
             except (OSError, TypeError):
                 stamp = None
             if stamp and stamp != state.get("stamp"):
-                tg = run_tokenograph(transcript)
+                tg = run_tokenograph(src)
                 if tg is not None:
                     metrics = derive_metrics(tg)
                     state["stamp"] = stamp
-        else:
-            return None                          # a hook we don't act on
-        if not state.get("tty") and not dry_run:
+                    if fill is None:
+                        ctx = (tg.get("stats") or {}).get("context") or {}
+                        pct = ctx.get("pct")
+                        if (ctx.get("used") or 0) > 0 and isinstance(pct, (int, float)):
+                            fill = clamp(float(pct))
+
+        if tty:
+            state["tty"] = tty
+        elif not state.get("tty") and not dry_run:
             state["tty"] = session_tty()         # also tells the hover legend which tab this is
-        if data.get("transcript_path"):
-            state["transcript"] = data["transcript_path"]   # for the legend's Tokenograph button
+        if transcript:
+            state["transcript"] = transcript     # for the legend's Tokenograph button
+        if agent_pid and not dry_run and state.get("tty"):
+            ensure_exit_watcher(key, agent_pid, state["tty"], state)
         state, frame = step(state, now, fill=fill, working=working, metrics=metrics)
-        emit(frame_bytes(frame), dry_run, state.get("tty"))
+        emit(frame_bytes(frame), dry_run, state.get("tty"), use_dev_tty=use_dev_tty)
         save_state(path, state)
         return readout(state, frame)
+
+
+def hook_or_statusline(data, dry_run):
+    """Claude Code stdin JSON adapter over `tick_session`."""
+    raw_event = data.get("hook_event_name")
+    key = data.get("session_id") or "session"
+    if raw_event is not None:
+        mapped = CLAUDE_EVENTS.get(raw_event)
+        if mapped is None:
+            return None
+        return tick_session(key, transcript=data.get("transcript_path"),
+                            event=mapped, refresh=False, dry_run=dry_run)
+    return tick_session(key, transcript=data.get("transcript_path"),
+                        fill=context_fill(data), event=None, refresh=True, dry_run=dry_run)
+
+
+def agy_hook(data, dry_run=False):
+    """Antigravity (`agy`) hook adapter over `tick_session`.
+
+    Returns the JSON dict `agy` expects on stdout (never raises, never blocks).
+    """
+    event_name = data.get("hookEventName")
+    reply = {"decision": "allow"} if event_name == "Stop" else {}
+    spec = AGY_EVENTS.get(event_name)
+    if spec is None:
+        return reply
+    key = data.get("conversationId") or "agy"
+    transcript = data.get("transcriptPath")
+    tty, agent_pid = (None, None) if dry_run else agy_tty_and_pid()
+    if not dry_run and not tty:
+        return reply                             # GUI session with no terminal attached
+    mapped, refresh = spec
+    tick_session(key, transcript=transcript, event=mapped, refresh=refresh,
+                 dry_run=dry_run, tty=tty, use_dev_tty=False, agent_pid=agent_pid)
+    return reply
 
 
 def manual(args):
@@ -673,18 +871,47 @@ def main(argv=None):
             print(line)
         return 0
 
+    if argv in (["agy-hook"], ["--dry-run", "agy-hook"], ["agy-hook", "--dry-run"]):
+        dry = "--dry-run" in argv
+        try:
+            data = json.load(sys.stdin)
+        except (ValueError, OSError):
+            data = {}
+        payload = data if isinstance(data, dict) else {}
+        try:
+            reply = agy_hook(payload, dry_run=dry)
+        except Exception:                        # never break agy's hook loop
+            reply = {"decision": "allow"} if payload.get("hookEventName") == "Stop" else {}
+        print(json.dumps(reply))
+        return 0
+
+    dry_sub = argparse.ArgumentParser(add_help=False)
+    dry_sub.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
+                         help="print the escape sequences instead of sending them")
+
     ap = argparse.ArgumentParser(prog="blackhole_instrument.py",
                                  description="Drive the Ghostty black hole instrument.")
     ap.add_argument("--dry-run", action="store_true", help="print the escape sequences instead of sending them")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    p = sub.add_parser("set", help="set read-outs by hand")
+    p = sub.add_parser("tick", parents=[dry_sub], help="harness-neutral session tick")
+    p.add_argument("--session", required=True, help="session key (state file name)")
+    p.add_argument("--transcript", help="path to the session transcript")
+    p.add_argument("--fill", type=float, help="context fill 0..1 (falls back to Tokenograph)")
+    p.add_argument("--event", choices=TICK_EVENTS, help="lifecycle event")
+    p.add_argument("--tty", help="explicit terminal device path")
+    sub.add_parser("agy-hook", parents=[dry_sub], help="Antigravity (agy) lifecycle hook handler")
+    p = sub.add_parser("watch-exit", help=argparse.SUPPRESS)
+    p.add_argument("--session", required=True)
+    p.add_argument("--pid", type=int, required=True)
+    p.add_argument("--tty", default=None)
+    p = sub.add_parser("set", parents=[dry_sub], help="set read-outs by hand")
     p.add_argument("--fill", type=float, help="context fill 0..1 (hole size)")
     p.add_argument("--burn", type=float, help="0 idle .. 1 fastest output")
     p.add_argument("--heat", type=float, help="0 cache lost .. 1 cache healthy")
     p.add_argument("--flare", choices=sorted(FLARE_KINDS), help="start a flare now")
     p.add_argument("--mag", type=int, choices=(1, 2, 3), default=3, help="flare strength")
-    sub.add_parser("off", help="reset cursor colour and palette; the hole hides")
-    sub.add_parser("demo", help="a 50-second tour of every read-out")
+    sub.add_parser("off", parents=[dry_sub], help="reset cursor colour and palette; the hole hides")
+    sub.add_parser("demo", parents=[dry_sub], help="a 50-second tour of every read-out")
     p = sub.add_parser("show", help="print what Tokenograph says about a transcript")
     p.add_argument("transcript")
     p = sub.add_parser("panel", help="open Tokenograph's live panel for a session")
@@ -693,6 +920,24 @@ def main(argv=None):
     p.add_argument("--close", action="store_true", help="stop that session's panel")
     p.add_argument("--close-all", action="store_true", help="stop every panel this bridge started")
     args = ap.parse_args(argv)
+
+    if args.cmd == "watch-exit":
+        try:
+            wait_for_exit(args.pid)
+            tick_session(args.session, event="end", tty=args.tty, use_dev_tty=False)
+        except Exception:
+            pass
+        return 0
+
+    if args.cmd == "tick":
+        refresh = bool(args.transcript and args.event not in ("start", "end"))
+        try:
+            tick_session(args.session, transcript=args.transcript, fill=args.fill,
+                         event=args.event, refresh=refresh, dry_run=args.dry_run,
+                         tty=args.tty, use_dev_tty=not bool(args.tty))
+        except Exception:
+            pass
+        return 0
 
     if args.cmd == "panel":
         if args.close_all:
